@@ -219,9 +219,10 @@ run "
 #
 # .cargo/config.toml target-specific settings are not affected by the
 # wrapper, so we append the cross-linker config to the vendored
-# config.toml that cargo prepare-debian generates.
+# config.toml that cargo prepare-debian generates, or create a minimal
+# config when building from a non-vendored checkout.
 if [ "$ARCH" = "ppc64el" ]; then
-    run 'printf "\n[target.powerpc64le-unknown-linux-gnu]\nlinker = \"powerpc64le-linux-gnu-gcc\"\n" >> /build/src/.cargo/config.toml'
+    run 'mkdir -p /build/src/.cargo && grep -q powerpc64le /build/src/.cargo/config.toml 2>/dev/null || printf "\n[target.powerpc64le-unknown-linux-gnu]\nlinker = \"powerpc64le-linux-gnu-gcc\"\n" >> /build/src/.cargo/config.toml'
 fi
 
 # Cap parallelism — nproc can report 80+ on big machines, which

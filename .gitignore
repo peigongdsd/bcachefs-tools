@@ -20,6 +20,7 @@ initramfs/hook
 !.github/dependabot.yml
 !.github/workflows/
 !.editorconfig
+.cargo/config.toml
 
 bcachefs-principles-of-operation.*
 doc/generated/
