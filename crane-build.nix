@@ -4,6 +4,7 @@
   stdenvNoCC,
 
   # build time
+  jq,
   pkg-config,
   rustPlatform,
   versionCheckHook,
@@ -14,6 +15,7 @@
   libaio,
   libunwind,
   libsodium,
+  libunwind,
   liburcu,
   libuuid,
   lz4,
@@ -52,6 +54,7 @@ let
     dontStrip = true;
 
     nativeBuildInputs = [
+      jq
       pkg-config
       rustPlatform.bindgenHook
     ];
@@ -61,6 +64,7 @@ let
       libaio
       libunwind
       libsodium
+      libunwind
       liburcu
       libuuid
       lz4

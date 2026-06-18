@@ -6,15 +6,16 @@ use std::path::Path;
 use std::process;
 
 use anyhow::{anyhow, Result};
-use bch_bindgen::bcachefs;
-use bch_bindgen::c;
-use bch_bindgen::fs::Fs;
-use bch_bindgen::opt_set;
+use bch_bindgen::fs::FsExt;
+use bcachefs_kernel::c;
+use bcachefs_kernel::fs::Fs;
+use bcachefs_kernel::metadata_version;
+use bcachefs_kernel::opt_set;
 use clap::Parser;
 use rustix::event::{poll, PollFd, PollFlags};
 
 use crate::wrappers::handle::BcachefsHandle;
-use bch_bindgen::printbuf::Printbuf;
+use bcachefs_kernel::util::printbuf::Printbuf;
 use crate::device_multipath::{find_multipath_holder, warn_multipath_component};
 use crate::wrappers::sysfs;
 use crate::device_scan;
@@ -90,7 +91,7 @@ fn do_splice(rfd: BorrowedFd, wfd: BorrowedFd) -> io::Result<bool> {
         match rustix::io::write(wfd, &buf[off..n]) {
             Ok(w) => off += w,
             Err(rustix::io::Errno::AGAIN) => {
-                poll(&mut [PollFd::new(&wfd, PollFlags::OUT)], -1)?;
+                poll(&mut [PollFd::new(&wfd, PollFlags::OUT)], None)?;
             }
             Err(e) => return Err(e.into()),
         }
@@ -112,7 +113,7 @@ fn splice_fd_to_stdinout(fd: BorrowedFd) -> i32 {
         if !stdin_closed {
             pollfds.push(PollFd::new(&stdin, PollFlags::IN));
         }
-        let _ = poll(&mut pollfds, -1);
+        let _ = poll(&mut pollfds, None);
 
         match do_splice(fd, stdout.as_fd()) {
             Ok(true) => break,
@@ -158,13 +159,13 @@ fn should_use_kernel_fsck(devs: &[String]) -> bool {
         return false;
     }
 
-    let current = c::bcachefs_metadata_version::bcachefs_metadata_version_max as u64 - 1;
+    let current = u32::from(metadata_version::max) as u64 - 1;
     if kernel_version == current {
         return false;
     }
 
     let dev_paths: Vec<std::path::PathBuf> = devs.iter().map(|d| d.as_str().into()).collect();
-    let mut opts = bcachefs::bch_opts::default();
+    let mut opts = c::bch_opts::default();
     opt_set!(opts, nostart, 1);
     opt_set!(opts, noexcl, 1);
     opt_set!(opts, nochanges, 1);
@@ -238,12 +239,26 @@ fn cmd_fsck(cli: FsckCli) -> Result<()> {
         None
     };
 
+    // If the user explicitly set recovery_passes, skip the "fsck" option:
+    // with fsck=1 the kernel ORs in the full PASS_FSCK default set on top
+    // of the user's request, so -o recovery_passes=check_dirents would
+    // still run check_allocations, check_alloc_info, etc. Dropping fsck
+    // lets the user's pass selection be the actual set that runs.
+    let user_set_recovery_passes = cli.opts.iter().any(|o| {
+        o.split(',').any(|tok| {
+            tok == "recovery_passes" || tok.starts_with("recovery_passes=")
+        })
+    });
+
     let mut opts: Vec<String> = vec![
         "degraded".into(),
-        "fsck".into(),
         "fix_errors=ask".into(),
         "read_only".into(),
+        "noreconcile_enabled".into(),
     ];
+    if !user_set_recovery_passes {
+        opts.insert(1, "fsck".into());
+    }
 
     if cli.yes {
         opts.push("fix_errors=yes".into());
@@ -271,7 +286,7 @@ fn cmd_fsck(cli: FsckCli) -> Result<()> {
     }
 
     let opts_str = opts.join(",");
-    let fs_opts = bch_bindgen::opts::parse_mount_opts_vec(&opts, false)
+    let fs_opts = bcachefs_kernel::opts::parse_mount_opts_vec(&opts, false)
         .map_err(|e| anyhow!("error parsing options: {}", crate::wrappers::bch_err_str(e.raw())))?;
 
     // Check if any device is a mountpoint/directory (online fsck)
@@ -300,7 +315,7 @@ fn cmd_fsck(cli: FsckCli) -> Result<()> {
     // specifies a single device, scan for other members by UUID — same
     // as mount does.
     let devices: Vec<String> = if devices.len() == 1 {
-        let scan_opts = bch_bindgen::opts::parse_mount_opts(None, None, true)
+        let scan_opts = bcachefs_kernel::opts::parse_mount_opts(None, None, true)
             .unwrap_or_default();
         match device_scan::scan_sbs(&devices[0], &scan_opts) {
             Ok(sbs) => sbs.into_iter()

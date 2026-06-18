@@ -1,14 +1,20 @@
+# `:=` (simple expansion) is load-bearing here: VERSION feeds into DKMSDIR,
+# the dkms.conf PACKAGE_VERSION, version.h, and the `dkms add/remove` args.
+# With recursive `=` the $(shell git describe) re-runs on every $(VERSION)
+# expansion — so HEAD moving mid-recipe (e.g. a commit/rebase landing during
+# a long `make install_dkms`) can land the six install steps in two
+# different /usr/src/bcachefs-vN/ trees. Lock VERSION once at make start.
 ifneq ($(wildcard .git),)
-VERSION=$(shell git -c safe.directory=$$PWD -c core.abbrev=12 describe)
+VERSION:=$(shell git -c safe.directory=$$PWD -c core.abbrev=12 describe)
 else ifneq ($(wildcard .version),)
-VERSION=$(shell cat .version)
+VERSION:=$(shell cat .version)
 else
-VERSION=$(shell cargo metadata --format-version 1 | jq -r '.packages[] | select(.name | test("bcachefs-tools")) | .version')
+VERSION:=$(shell cargo metadata --format-version 1 | jq -r '.packages[] | select(.name | test("bcachefs-tools")) | .version')
 endif
 
 PREFIX?=/usr/local
 LIBEXECDIR?=$(PREFIX)/libexec
-DKMSDIR?=$(PREFIX)/src/bcachefs-$(VERSION)
+DKMSDIR?=/usr/src/bcachefs-$(VERSION)
 PKG_CONFIG?=pkg-config
 INSTALL=install
 LN=ln
@@ -38,16 +44,62 @@ else
 	BUILT_BIN = target/release/bcachefs
 endif
 
+# Persist build-option vars across invocations: `make debug` writes
+# build.vars; subsequent `make` / `make install` re-reads it. `make clean`
+# wipes it. This makes `make debug; make install` install a debug DKMS.
+-include build.vars
+
+# Vars that propagate from the userspace build into the host-side
+# `dkms build`. install_dkms writes whichever are set into
+# $(DKMSDIR)/build.vars; dkms/Makefile re-includes that file and exports
+# the same names so fs/Makefile's ifdefs fire during the module build.
+BCACHEFS_DKMS_FORWARD := BCACHEFS_DEBUG \
+                        BCACHEFS_TESTS \
+                        BCACHEFS_INJECT_TRANSACTION_RESTARTS \
+                        BCACHEFS_RUST
+
+# Vars persisted into the *local* build.vars across invocations - a
+# superset of BCACHEFS_DKMS_FORWARD that also covers MAKE_DEBUG, the
+# userspace-side debug switch (see below).
+BCACHEFS_LOCAL_PERSIST := MAKE_DEBUG $(BCACHEFS_DKMS_FORWARD)
+
+# `make debug` is a convenience alias that sets:
+#   MAKE_DEBUG:        userspace `bcachefs` binary built with
+#                      -DCONFIG_BCACHEFS_DEBUG=y -DCONFIG_VALGRIND=y
+#   BCACHEFS_DEBUG:    DKMS kernel-module debug build (forwarded via
+#                      $(DKMSDIR)/build.vars and fs/Makefile's ifdef)
+#   BCACHEFS_TESTS:    in-kernel unit tests in the DKMS module
+# All three are persisted via build.vars for the entire invocation and
+# any followups (`make debug; make install`).
+#
+# MAKE_DEBUG is intentionally distinct from BCACHEFS_DEBUG: ktest sets
+# BCACHEFS_DEBUG=1 in env to flip the DKMS module debug build, and must
+# not, on its own, also flip the userspace binary into a debug build
+# (the userspace debug checks blow CI test timeouts).
+#
+# BCACHEFS_INJECT_TRANSACTION_RESTARTS is deliberately not included -
+# the restart-injection build is only useful for its dedicated test
+# variant and shouldn't ride along with everyday debug builds.
+ifeq ($(filter debug,$(MAKECMDGOALS)),debug)
+    MAKE_DEBUG := 1
+    BCACHEFS_DEBUG := 1
+    BCACHEFS_TESTS := 1
+endif
+
+ifdef MAKE_DEBUG
+    EXTRA_CFLAGS += -DCONFIG_BCACHEFS_DEBUG=y -DCONFIG_VALGRIND=y
+endif
+
 # Prevent recursive expansions of $(CFLAGS) to avoid repeatedly performing
 # compile tests
 CFLAGS:=$(CFLAGS)
 
-CFLAGS+=-std=gnu11 -O2 -g -MMD -Wall -fPIC			\
+CFLAGS+=-std=gnu11 -O2 -g -MMD -MP -Wall -fPIC		\
 	-Wno-pointer-sign					\
 	-Wno-deprecated-declarations				\
 	-fno-strict-aliasing					\
 	-fno-delete-null-pointer-checks				\
-	-I. -Ic_src -Ilibbcachefs -Iinclude -Iraid		\
+	-I. -Ic_src -Ifs -Iinclude -Iraid		\
 	-D_FILE_OFFSET_BITS=64					\
 	-D_GNU_SOURCE						\
 	-D_LGPL_SOURCE						\
@@ -157,8 +209,11 @@ endif	# PKGCONFIG_SERVICEDIR
 all: bcachefs initramfs/hook dkms/dkms.conf $(optional_build)
 
 .PHONY: debug
-debug: CFLAGS+=-Werror -DCONFIG_BCACHEFS_DEBUG=y -DCONFIG_VALGRIND=y
-debug: bcachefs
+debug: write-build-vars bcachefs
+
+.PHONY: write-build-vars
+write-build-vars:
+	@( :; $(foreach v,$(BCACHEFS_LOCAL_PERSIST),$(if $($(v)),printf '%s := %s\n' '$(v)' '$($(v))';)) ) > build.vars
 
 .PHONY: TAGS tags
 TAGS:
@@ -167,9 +222,17 @@ TAGS:
 tags:
 	ctags -R .
 
-SRCS:=$(sort $(shell find . -type f ! -path '*/.*/*' ! -path './vendor/*' ! -path './debian/*' -iname '*.c'))
+SRCS:=$(sort $(shell find . -type f ! -path '*/.*/*' ! -path './vendor/*' ! -path './debian/*' ! -path './target/*' -iname '*.c'))
+# KUnit test — kernel-only, no userspace equivalent for <kunit/test.h>
+SRCS:=$(filter-out %/mean_and_variance_test.c, $(SRCS))
 DEPS:=$(SRCS:.c=.d)
 -include $(DEPS)
+
+# Old depfiles may mention headers that were removed or renamed. GCC's -MP
+# emits empty header rules for new depfiles; this keeps pre-existing stale
+# depfiles from failing before the object can be rebuilt.
+%.h:
+	@:
 
 OBJS:=$(SRCS:.c=.o)
 
@@ -178,7 +241,7 @@ OBJS:=$(SRCS:.c=.o)
 	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 BCACHEFS_DEPS=libbcachefs.a
-RUST_SRCS:=$(shell find src bch_bindgen/src -type f -iname '*.rs')
+RUST_SRCS:=$(shell find src fs bch_bindgen/src -type f -iname '*.rs')
 
 bcachefs: $(BCACHEFS_DEPS) $(RUST_SRCS)
 	$(Q)$(CARGO_BUILD)
@@ -193,7 +256,7 @@ libbcachefs.a: $(OBJS)
 	$(Q)echo "$(VERSION)" > .version.new
 	$(Q)cmp -s .version.new .version || mv .version.new .version
 
-VERSION_H=$(shell echo "#define bcachefs_version \\\"$(VERSION)\\\"")
+VERSION_H:=$(shell echo "#define bcachefs_version \\\"$(VERSION)\\\"")
 
 version.h: force
 	$(Q)echo "$(VERSION_H)" > version.h.new
@@ -220,6 +283,18 @@ initramfs/hook: initramfs/hook.in
 .PHONY: install
 BASH_COMPLETION_DIR?=$(shell $(PKG_CONFIG) --variable=completionsdir bash-completion 2>/dev/null || echo $(PREFIX)/share/bash-completion/completions)
 
+# True cross compile? (target arch != host arch). CARGO_BUILD_TARGET is
+# sometimes set to a triple whose arch matches the host (Debian packaging
+# passes --target x86_64-unknown-linux-gnu on x86_64 build hosts) - the
+# binary still runs natively in that case. Computed here at top level
+# because a variable assignment inside the install recipe terminates it
+# in some make versions.
+ifdef CARGO_BUILD_TARGET
+ifneq ($(firstword $(subst -, ,$(CARGO_BUILD_TARGET))),$(shell uname -m))
+SKIP_COMPLETIONS := 1
+endif
+endif
+
 install: INITRAMFS_HOOK=$(INITRAMFS_DIR)/hooks/bcachefs
 install: INITRAMFS_SCRIPT=$(INITRAMFS_DIR)/scripts/local-premount/bcachefs
 install: all install_dkms $(optional_install)
@@ -231,7 +306,13 @@ install: all install_dkms $(optional_install)
 	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/fsck.bcachefs
 	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/mount.bcachefs
 	$(INSTALL) -d $(DESTDIR)$(BASH_COMPLETION_DIR)
+# Generating completions runs the built binary; on a true cross compile
+# we can't, so skip (SKIP_COMPLETIONS is computed at top level above).
+ifdef SKIP_COMPLETIONS
+	@echo "    [SKIP]   bash completions (cross compiling for $(CARGO_BUILD_TARGET); can't run target binary on host)"
+else
 	$(BUILT_BIN) completions bash > $(DESTDIR)$(BASH_COMPLETION_DIR)/bcachefs
+endif
 	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/mkfs.fuse.bcachefs
 	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/fsck.fuse.bcachefs
 	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/mount.fuse.bcachefs
@@ -258,17 +339,48 @@ install_systemd: $(systemd_services) $(systemd_libexecfiles)
 install_dkms: dkms/dkms.conf dkms/module-version.c
 	$(INSTALL) -m0644 -D dkms/Makefile		-t $(DESTDIR)$(DKMSDIR)
 	$(INSTALL) -m0644 -D dkms/dkms.conf		-t $(DESTDIR)$(DKMSDIR)
-	$(INSTALL) -m0644 -D libbcachefs/Makefile	-t $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs
-	(cd libbcachefs; find -name '*.[ch]' -exec install -m0644 -D {} $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs/{} \; )
+	$(INSTALL) -m0644 -D fs/Makefile	-t $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs
+	(cd fs; find \( -name '*.[ch]' -o -name '*.rs' \) -exec install -m0644 -D {} $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs/{} \; )
+	$(INSTALL) -m0755 -D fs/scripts/getdents-layout.sh -t $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs/scripts
+	$(INSTALL) -m0755 -D fs/scripts/rust-is-available-dkms.sh -t $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs/scripts
 	$(INSTALL) -m0644 -D dkms/module-version.c	-t $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs
 	$(INSTALL) -m0644 -D version.h			-t $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs
-	sed -i "s|^#define TRACE_INCLUDE_PATH \\.\\./\\.\\./fs/bcachefs$$|#define TRACE_INCLUDE_PATH .|" \
-	  $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs/debug/trace.h
+	@( :; $(foreach v,$(BCACHEFS_DKMS_FORWARD),$(if $($(v)),printf '%s := %s\n' '$(v)' '$($(v))';)) ) > $(DESTDIR)$(DKMSDIR)/build.vars
+
+# dkms sizes its build parallelism from nproc, ignoring the -j passed to
+# `make dkms-reload`. In a memory-constrained VM — ktest runs tests in
+# VMs with as little as 4G — that OOMs while compiling debug-enabled
+# bcachefs. Budget 512M per compile job, and never exceed nproc (dkms's
+# own default).
+DKMS_PARALLEL_JOBS:=$(shell \
+	j=$$(( $$(awk '/^MemTotal:/{print $$2}' /proc/meminfo) / 1024 / 512 )); \
+	c=$$(nproc); [ $$c -lt $$j ] && j=$$c; [ $$j -lt 1 ] && j=1; echo $$j)
+
+# Build the kernel module via DKMS and load it. Must run as root
+# (sudo make dkms-reload). Idempotent — re-running rebuilds + reloads.
+#
+# No prerequisites: the recipe runs install_dkms itself, and the DKMS
+# module build uses nothing from the userspace `all` target — depending
+# on it would just force an unnecessary rebuild of the bcachefs binary.
+.PHONY: dkms-reload
+dkms-reload:
+	@if [ "$$(id -u)" -ne 0 ]; then \
+		echo "dkms-reload: must run as root (sudo make $@)"; exit 1; \
+	fi
+	$(Q)$(MAKE) install_dkms
+	@echo "    [DKMS]   bcachefs/$(VERSION)"
+	$(Q)dkms remove  -m bcachefs -v $(VERSION) --all 2>/dev/null || true
+	$(Q)dkms add     -m bcachefs -v $(VERSION)
+	$(Q)dkms build   -m bcachefs -v $(VERSION) -j $(DKMS_PARALLEL_JOBS)
+	$(Q)dkms install -m bcachefs -v $(VERSION)
+	$(Q)modprobe -r bcachefs 2>/dev/null || true
+	$(Q)modprobe bcachefs
+	@modinfo bcachefs | grep -E '^(version|filename|srcversion):'
 
 .PHONY: clean
 clean:
 	@echo "Cleaning all"
-	$(Q)$(RM) libbcachefs.a c_src/libbcachefs.a .version dkms/dkms.conf *.tar.xz $(OBJS) $(DEPS) $(DOCGENERATED)
+	$(Q)$(RM) libbcachefs.a c_src/libbcachefs.a .version dkms/dkms.conf build.vars *.tar.xz $(OBJS) $(DEPS) $(DOCGENERATED)
 	$(Q)$(CARGO_CLEAN)
 	$(Q)$(RM) -f $(built_scripts)
 
@@ -294,19 +406,13 @@ doc: bcachefs-principles-of-operation.pdf
 .PHONY: cargo-update-msrv
 cargo-update-msrv:
 	cargo +nightly generate-lockfile -Zmsrv-policy
-	cargo +nightly generate-lockfile --manifest-path bch_bindgen/Cargo.toml -Zmsrv-policy
+	cargo +nightly generate-lockfile --manifest-path fs/Cargo.toml -Zmsrv-policy
 
-.PHONY: update-bcachefs-sources
-update-bcachefs-sources:
-	git rm -rf --ignore-unmatch libbcachefs
-	mkdir -p libbcachefs/vendor
-	cp -r $(LINUX_DIR)/fs/bcachefs/* libbcachefs/
-	git add libbcachefs/*.[ch]
-	git add libbcachefs/*/*.[ch]
-	git add libbcachefs/*/*/*.[ch]
-	git add libbcachefs/Makefile
-	git add libbcachefs/Kconfig
-	git rm -f libbcachefs/util/mean_and_variance_test.c
+# Refresh the small set of kernel files we vendor verbatim (not bcachefs
+# source — that lives in fs/ and is developed in-tree now). See
+# doc/vendored-kernel-files.md for the why and the list.
+.PHONY: update-vendored-kernel-sources
+update-vendored-kernel-sources:
 	cp $(LINUX_DIR)/include/linux/xxhash.h include/linux/
 	git add include/linux/xxhash.h
 	cp $(LINUX_DIR)/lib/xxhash.c linux/
@@ -325,14 +431,10 @@ update-bcachefs-sources:
 	git add linux/int_sqrt.c
 	cp $(LINUX_DIR)/scripts/Makefile.compiler ./
 	git add Makefile.compiler
-	$(RM) libbcachefs/*.mod.c
-	git -C $(LINUX_DIR) rev-parse HEAD | tee .bcachefs_revision
-	git add .bcachefs_revision
 
-
-.PHONY: update-commit-bcachefs-sources
-update-commit-bcachefs-sources: update-bcachefs-sources
-	git commit -m "Update bcachefs sources to $(shell git -C $(LINUX_DIR) show --oneline --no-patch)"
+.PHONY: update-commit-vendored-kernel-sources
+update-commit-vendored-kernel-sources: update-vendored-kernel-sources
+	git commit -m "Update vendored kernel sources to $(shell git -C $(LINUX_DIR) show --oneline --no-patch)"
 
 SRCTARXZ = bcachefs-tools-$(VERSION).tar.xz
 SRCDIR=bcachefs-tools-$(VERSION)

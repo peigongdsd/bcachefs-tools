@@ -22,22 +22,25 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{anyhow, bail, Result};
+use bch_bindgen::fs::FsExt;
 use bch_bindgen::c;
-use bch_bindgen::fs::Fs;
-use bch_bindgen::opt_set;
+use bcachefs_kernel::fs::Fs;
+use bcachefs_kernel::sb::sb_field_type;
+use bcachefs_kernel::{metadata_version, opt_id};
+use bcachefs_kernel::opt_set;
 
 use crate::commands::opts::{bch_opt_lookup_negated, opts_usage_str, parse_opt_val};
 use crate::device_multipath::{find_multipath_holder, warn_multipath_component};
 use crate::key::Passphrase;
 use crate::util::parse_human_size;
-use bch_bindgen::printbuf::Printbuf;
+use bcachefs_kernel::util::printbuf::Printbuf;
 use crate::wrappers::super_io::SUPERBLOCK_SIZE_DEFAULT;
 use crate::wrappers::sysfs;
 
 const BCH_REPLICAS_MAX: u32 = 4;
 
 pub(crate) fn metadata_version_current() -> u32 {
-    c::bcachefs_metadata_version::bcachefs_metadata_version_max as u32 - 1
+    u32::from(metadata_version::max) - 1
 }
 
 /// Parse a version string "major.minor" or just "minor" (major defaults to 0).
@@ -154,7 +157,7 @@ struct FormatConfig {
     format_version:  Option<u32>,
     superblock_size: u32,
     fs_opts:         c::bch_opts,
-    deferred_opts:   Vec<(usize, String)>,
+    deferred_opts:   Vec<(c::bch_opt_id, String)>,
 }
 
 fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
@@ -182,7 +185,7 @@ fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
     let mut unconsumed_dev_option = false;
 
     let mut fs_opts: c::bch_opts = Default::default();
-    let mut deferred_opts: Vec<(usize, String)> = Vec::new();
+    let mut deferred_opts: Vec<(c::bch_opt_id, String)> = Vec::new();
 
     macro_rules! push_device {
         ($path:expr) => {{
@@ -234,13 +237,13 @@ fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
                     };
 
                     match parse_opt_val(opt, &val_str)? {
-                        None => deferred_opts.push((opt_id as usize, val_str)),
+                        None => deferred_opts.push((opt_id, val_str)),
                         Some(v) => {
                             if opt.flags as u32 & c::opt_flags::OPT_DEVICE as u32 != 0 {
-                                bch_bindgen::opts::opt_set_by_id(&mut cur_dev_opts, opt_id, v);
+                                bcachefs_kernel::opts::opt_set_by_id(&mut cur_dev_opts, opt_id, v);
                                 unconsumed_dev_option = true;
                             } else if opt.flags as u32 & c::opt_flags::OPT_FS as u32 != 0 {
-                                bch_bindgen::opts::opt_set_by_id(&mut fs_opts, opt_id, v);
+                                bcachefs_kernel::opts::opt_set_by_id(&mut fs_opts, opt_id, v);
                             }
                         }
                     }
@@ -490,6 +493,43 @@ fn cmd_format(argv: Vec<String>) -> Result<()> {
         })?;
     }
 
+    // Default shard_inode_numbers_bits if the user didn't set it. The policy
+    // (cpu-scaled, fs-size-capped, clamped to [0, 8]) lives in C —
+    // bch2_shard_inode_numbers_bits_default() — so the format-time default and
+    // the kernel sb_validate rewrite of legacy bits=0 filesystems can't diverge.
+    if !bcachefs_kernel::opts::opt_defined_by_id(&cfg.fs_opts, opt_id::shard_inode_numbers_bits) {
+        let nr_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1) as u32;
+
+        // Total fs size in bytes, populating per-device sizes from fd if the
+        // user didn't specify them.
+        let total_fs_size: u64 = devices.iter_mut().map(|d| {
+            if d.fs_size == 0 {
+                d.fs_size = crate::wrappers::bdev::get_size(d.fd);
+            }
+            d.fs_size
+        }).sum();
+
+        // btree_node_size in bytes; 0 here if the user didn't override (the
+        // default isn't materialized until later), so fall back to the same
+        // 256K default the format path picks.
+        let btree_node_bytes = if cfg.fs_opts.btree_node_size != 0 {
+            cfg.fs_opts.btree_node_size as u64
+        } else {
+            256 << 10
+        };
+
+        let bits = unsafe {
+            c::bch2_shard_inode_numbers_bits_default(nr_cpus, total_fs_size, btree_node_bytes)
+        } as u64;
+        bcachefs_kernel::opts::opt_set_by_id(
+            &mut cfg.fs_opts,
+            opt_id::shard_inode_numbers_bits,
+            bits,
+        );
+    }
+
     let sb = crate::commands::format_util::format(fs_opt_strs, cfg.fs_opts, fmt_opts, &mut devices);
     if sb.is_null() {
         bail!("format returned null");
@@ -499,7 +539,7 @@ fn cmd_format(argv: Vec<String>) -> Result<()> {
     if !cfg.quiet {
         let mut buf = Printbuf::new();
         buf.set_human_readable(true);
-        let fields = 1u32 << c::bch_sb_field_type::BCH_SB_FIELD_members_v2 as u32;
+        let fields = sb_field_type::members_v2.bit();
         unsafe { crate::wrappers::sb_display::sb_to_text_with_names(&mut buf, std::ptr::null_mut(), &*sb, false, fields, -1) };
         print!("{}", buf);
     }

@@ -7,8 +7,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bch_bindgen::c::{
-    bch_data_type, bch_ioctl_data, bch_ioctl_data_event_ret, bch_ioctl_data_progress,
+    bch_ioctl_data, bch_ioctl_data_event_ret, bch_ioctl_data_progress,
+    bch_ioctl_data__bindgen_ty_1__bindgen_ty_1 as ScrubArgs,
 };
+use bch_bindgen::accounting::data_type;
 use clap::Parser;
 
 use crate::util::{fmt_bytes_human, fmt_sectors_human};
@@ -49,8 +51,18 @@ fn start_scrub(ioctl_fd: i32, dev_idx: u32, data_types: u32) -> Result<std::fs::
         op: bch_bindgen::c::bch_data_ops::BCH_DATA_OP_scrub as u16,
         ..Default::default()
     };
-    cmd.__bindgen_anon_1.scrub.dev = dev_idx;
-    cmd.__bindgen_anon_1.scrub.data_types = data_types;
+    // bch_ioctl_data's op-params union is emitted as either a native Rust union or
+    // the __BindgenUnionField wrapper, depending on the host libclang's Copy analysis
+    // of its blocklisted __u32 members — non-deterministic across build hosts, and
+    // the wrapper's helper type isn't nameable here. Both forms share one C layout,
+    // so write the scrub params positionally; the asserts pin the layout we rely on.
+    const _: () = assert!(std::mem::offset_of!(ScrubArgs, dev) == 0);
+    const _: () = assert!(std::mem::offset_of!(ScrubArgs, data_types) == 4);
+    unsafe {
+        let p = std::ptr::addr_of_mut!(cmd.__bindgen_anon_1) as *mut u32;
+        p.write(dev_idx);
+        p.add(1).write(data_types);
+    }
 
     let request = bch_ioc_w::<bch_ioctl_data>(BCH_IOCTL_DATA_NR);
     let ret = unsafe { libc::ioctl(ioctl_fd, request, &mut cmd as *mut bch_ioctl_data) };
@@ -113,7 +125,7 @@ fn scrub(cli: Cli) -> Result<()> {
     unsafe { libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t); }
 
     let data_types: u32 = if cli.metadata {
-        1 << (bch_data_type::BCH_DATA_btree as u32)
+        1 << u32::from(data_type::btree)
     } else {
         !0u32
     };

@@ -93,6 +93,7 @@ BuildRequires:  pkgconfig(libkeyutils)
 BuildRequires:  pkgconfig(liblz4)
 BuildRequires:  pkgconfig(libsodium)
 BuildRequires:  pkgconfig(libudev)
+BuildRequires:  pkgconfig(libunwind)
 BuildRequires:  pkgconfig(liburcu) >= 0.15
 BuildRequires:  pkgconfig(libzstd)
 BuildRequires:  pkgconfig(udev)
@@ -133,6 +134,7 @@ check, modify and correct any inconsistencies in the bcachefs filesystem.
 %{_sbindir}/mount.fuse.bcachefs
 %{_sbindir}/fsck.fuse.bcachefs
 %{_sbindir}/mkfs.fuse.bcachefs
+%{_unitdir}/bcachefs-wait-devices@.service
 
 %package -n %{dkmsname}
 Summary:        Bcachefs kernel module managed by DKMS

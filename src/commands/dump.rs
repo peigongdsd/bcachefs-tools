@@ -1,4 +1,3 @@
-
 use std::ops::ControlFlow;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::path::Path;
@@ -7,14 +6,13 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use clap::Parser;
 
-use bch_bindgen::bkey::BkeySC;
-use bch_bindgen::btree::*;
-use bch_bindgen::accounting;
-use bch_bindgen::c;
-use bch_bindgen::data::extents::bkey_ptrs_sc;
-use bch_bindgen::fs::Fs;
-use bch_bindgen::opt_set;
-use bch_bindgen::POS_MIN;
+use bcachefs_kernel::btree;
+use bcachefs_kernel::btree::bkey::bkey_type;
+use bcachefs_kernel::c;
+use bcachefs_kernel::data::extents::bkey_ptrs_sc;
+use bcachefs_kernel::fs::Fs;
+use bcachefs_kernel::opt_set;
+use bcachefs_kernel::POS_MIN;
 
 use crate::qcow2::{self, Qcow2Image, Ranges, range_add, ranges_sort};
 use crate::wrappers::super_io::vstruct_bytes_sb;
@@ -182,18 +180,17 @@ fn vstruct_aligned_bytes(bytes: usize, block_bits: usize) -> usize {
 ///  - indirect_inline_data: refcount(8), data — zero data
 ///  - dirent:               d_inum(8), d_type(1), d_name — fill with 'X'
 fn sanitize_val(val: &mut [u8], key_type: u8, sanitize_filenames: bool) -> bool {
-    use c::bch_bkey_type::*;
     let t = key_type as u32;
 
-    if t == KEY_TYPE_inline_data as u32 {
+    if t == u32::from(bkey_type::inline_data) {
         val.fill(0);
         true
-    } else if t == KEY_TYPE_indirect_inline_data as u32 {
+    } else if t == u32::from(bkey_type::indirect_inline_data) {
         if val.len() > 8 {
             val[8..].fill(0);
         }
         true
-    } else if t == KEY_TYPE_dirent as u32 && sanitize_filenames {
+    } else if t == u32::from(bkey_type::dirent) && sanitize_filenames {
         if val.len() > 9 {
             val[9..].fill(b'X');
         }
@@ -436,7 +433,7 @@ impl DumpDev {
     }
 }
 
-fn dump_node(fs: &Fs, devs: &mut [DumpDev], k: BkeySC<'_>, btree_node_size: u64) {
+fn dump_node(fs: &Fs, devs: &mut [DumpDev], k: btree::BkeySC<'_>, btree_node_size: u64) {
     let val = k.v();
     for ptr in bkey_ptrs_sc(&val) {
         let dev = ptr.dev() as usize;
@@ -579,33 +576,30 @@ fn dump_fs(fs: &Fs, cli: &DumpCli, sanitize: bool, sanitize_filenames: bool) -> 
         return Err(anyhow!("{}", err));
     }
 
-    // Walk all btree types (including dynamic) to collect metadata locations
+    // Walk all btree types (including dynamic) to collect metadata locations.
+    // The node iterator is per-level, so loop every level and dump each node's
+    // own location (b.key) -- this reaches the root and every interior level,
+    // no special-casing. Walking via the iterator (not a raw DFS) applies the
+    // journal overlay, so nodes reachable only through not-yet-replayed journal
+    // entries are captured too.
     for id in 0..fs.btree_id_nr_alive() {
-        let trans = BtreeTrans::new(fs);
-        let mut node_iter = BtreeNodeIter::new(
-            &trans,
-            id,
-            POS_MIN,
-            0, // locks_want
-            1, // depth
-            BtreeIterFlags::PREFETCH,
-        );
+        let trans = btree::BtreeTrans::new(fs);
 
-        node_iter.for_each(&trans, |b| {
-            let _ = b.for_each_key(|k| {
-                dump_node(fs, &mut devs, k, btree_node_size);
+        for level in 0..(c::BTREE_MAX_DEPTH as u32) {
+            let mut node_iter = btree::BtreeNodeIter::new(
+                &trans,
+                id,
+                POS_MIN,
+                0, // locks_want
+                level,
+                btree::BtreeIterFlags::PREFETCH,
+            );
+
+            node_iter.for_each(&trans, |b| {
+                dump_node(fs, &mut devs, btree::BkeySC::from(&b.key), btree_node_size);
                 ControlFlow::Continue(())
-            });
-            ControlFlow::Continue(())
-        }).map_err(|e| anyhow!("error walking btree {}: {}",
-            accounting::btree_id_str(id), e))?;
-
-        // Also dump the root node itself
-        if let Some(b) = fs.btree_id_root(id) {
-            if !b.is_fake() {
-                let k = BkeySC::from(&b.key);
-                dump_node(fs, &mut devs, k, btree_node_size);
-            }
+            }).map_err(|e| anyhow!("error walking btree {}: {}",
+                btree::types::btree_id_str(id), e))?;
         }
     }
 

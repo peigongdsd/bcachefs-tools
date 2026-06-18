@@ -4,10 +4,10 @@
 
 use std::ffi::{CStr, CString};
 use std::os::unix::fs::FileExt;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{IntoRawFd, RawFd};
 
 use bch_bindgen::c;
-use bch_bindgen::{opt_defined, opt_get, opt_set};
+use bcachefs_kernel::{metadata_version, opt_defined, opt_get, opt_set};
 
 use crate::wrappers::super_io::{die, BCHFS_MAGIC, SUPERBLOCK_SIZE_DEFAULT};
 
@@ -47,14 +47,14 @@ impl DevOpts {
     pub fn open(&mut self, extra_mode: u32, force: bool) -> Result<(), i32> {
         use crate::wrappers::bdev::*;
         let mode = BLK_OPEN_READ | BLK_OPEN_WRITE | BLK_OPEN_EXCL | BLK_OPEN_BUFFERED | extra_mode;
-        self.fd = open_device(&self.path, mode)?;
+        self.fd = open_device(&self.path, mode)?.into_raw_fd();
         blkid_check(self.fd, &self.path, force);
         Ok(())
     }
 
     /// Open the device without blkid checks or default flags (for migrate).
     pub fn open_no_blkid(&mut self, mode: u32) -> Result<(), i32> {
-        self.fd = crate::wrappers::bdev::open_device(&self.path, mode)?;
+        self.fd = crate::wrappers::bdev::open_device(&self.path, mode)?.into_raw_fd();
         Ok(())
     }
 }
@@ -125,7 +125,7 @@ fn parse_target(
 
 /// Set all sb options from a bch_opts struct.
 fn opt_set_sb_all(sb: &mut c::bch_sb, dev_idx: i32, opts: &mut c::bch_opts) {
-    use bch_bindgen::opts;
+    use bcachefs_kernel::opts;
 
     for (id, opt) in opts::opt_table().iter().enumerate() {
         let opt_id = opts::opt_id(id);
@@ -189,7 +189,7 @@ pub fn format(
 
     // Calculate btree node size
     if opt_defined!(fs_opts, btree_node_size) == 0 {
-        let mut s = bch_bindgen::opts::opts_default().btree_node_size;
+        let mut s = bcachefs_kernel::opts::opts_default().btree_node_size;
         for dev in dev_slice.iter() {
             s = s.min(dev.opts.bucket_size);
         }
@@ -229,7 +229,7 @@ pub fn format(
     sb.sb_mut().set_sb_extent_bp_shift(16);
 
     let version_threshold =
-        c::bcachefs_metadata_version::bcachefs_metadata_version_disk_accounting_big_endian as u32;
+        u32::from(metadata_version::disk_accounting_big_endian);
     if opts.version > version_threshold {
         sb.sb_mut().features[0] |= BCH_SB_FEATURES_ALL.to_le();
     }
@@ -270,7 +270,7 @@ pub fn format(
         + std::mem::size_of::<c::bch_member>() * dev_slice.len();
     let mi_u64s = mi_size / std::mem::size_of::<u64>();
 
-    let mi = bch_bindgen::sb::sb_field_resize::<c::bch_sb_field_members_v2>(&mut *sb, mi_u64s as u32)
+    let mi = bcachefs_kernel::sb::io::sb_field_resize::<c::bch_sb_field_members_v2>(&mut sb, mi_u64s as u32)
         .unwrap_or_else(|| die("failed to resize members_v2 field"));
     mi.member_bytes = (std::mem::size_of::<c::bch_member>() as u16).to_le();
 
@@ -412,7 +412,7 @@ pub(crate) fn format_opts_default() -> c::format_opts {
 
     let kernel_version = crate::wrappers::sysfs::bcachefs_kernel_version() as u32;
     let current =
-        c::bcachefs_metadata_version::bcachefs_metadata_version_max as u32 - 1;
+        u32::from(metadata_version::max) - 1;
 
     let version = if kernel_version > 0 {
         current.min(kernel_version)
@@ -579,4 +579,3 @@ pub fn check_bucket_size(opts: &c::bch_opts, dev: &DevOpts) {
         ));
     }
 }
-

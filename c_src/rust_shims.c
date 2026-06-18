@@ -6,24 +6,24 @@
 #include <unistd.h>
 
 #include "libbcachefs.h"
-#include "libbcachefs/journal/read.h"
-#include "libbcachefs/journal/seq_blacklist.h"
-#include "libbcachefs/sb/io.h"
-#include "libbcachefs/sb/members.h"
-#include "libbcachefs/alloc/buckets_types.h"
-#include "libbcachefs/data/checksum.h"
-#include "libbcachefs/data/read.h"
-#include "libbcachefs/data/write.h"
-#include "libbcachefs/btree/read.h"
-#include "libbcachefs/init/error.h"
-#include "libbcachefs/init/fs.h"
-#include "libbcachefs/fs/inode.h"
-#include "libbcachefs/journal/journal.h"
-#include "libbcachefs/sb/clean.h"
-#include "libbcachefs/alloc/foreground.h"
-#include "libbcachefs/btree/update.h"
-#include "libbcachefs/data/extents.h"
-#include "libbcachefs/alloc/accounting.h"
+#include "fs/journal/read.h"
+#include "fs/journal/seq_blacklist.h"
+#include "fs/sb/io.h"
+#include "fs/sb/members.h"
+#include "fs/alloc/buckets_types.h"
+#include "fs/data/checksum.h"
+#include "fs/data/read.h"
+#include "fs/data/write.h"
+#include "fs/btree/read.h"
+#include "fs/init/error.h"
+#include "fs/init/fs.h"
+#include "fs/fs/inode.h"
+#include "fs/journal/journal.h"
+#include "fs/sb/clean.h"
+#include "fs/alloc/foreground.h"
+#include "fs/btree/update.h"
+#include "fs/data/extents.h"
+#include "fs/alloc/accounting.h"
 #include "rust_shims.h"
 
 struct bch_csum rust_csum_vstruct_sb(struct bch_sb *sb)
@@ -85,20 +85,6 @@ void rust_strip_alloc_do(struct bch_fs *c)
 	mutex_unlock(&c->sb_lock);
 }
 
-/* online member iteration shim */
-
-struct bch_dev *rust_get_next_online_dev(struct bch_fs *c,
-					 struct bch_dev *ca,
-					 unsigned ref_idx)
-{
-	return bch2_get_next_online_dev(c, ca, ~0U, READ, ref_idx);
-}
-
-void rust_put_online_dev_ref(struct bch_dev *ca, unsigned ref_idx)
-{
-	enumerated_ref_put(&ca->io_ref[READ], ref_idx);
-}
-
 struct rust_journal_entries rust_collect_journal_entries(struct bch_fs *c)
 {
 	struct rust_journal_entries ret = { NULL, 0 };
@@ -144,18 +130,6 @@ int rust_bset_decrypt(struct bch_fs *c, struct bset *i, unsigned offset)
 void rust_set_bit(unsigned long nr, unsigned long *addr)
 {
 	set_bit(nr, addr);
-}
-
-/* Device reference shims */
-
-struct bch_dev *rust_dev_tryget_noerror(struct bch_fs *c, unsigned dev)
-{
-	return bch2_dev_tryget_noerror(c, dev);
-}
-
-void rust_dev_put(struct bch_dev *ca)
-{
-	bch2_dev_put(ca);
 }
 
 /*
@@ -289,7 +263,8 @@ int rust_link_data(struct bch_fs *c,
 		struct bch_inode_opts opts;
 		ret = commit_do(trans, &res, NULL, 0, ({
 			bch2_bkey_get_io_opts(trans, NULL, bkey_i_to_s_c(&e->k_i), &opts) ?:
-			bch2_bkey_set_needs_reconcile(trans, NULL, &opts, &e->k_i,
+			bch2_bkey_set_needs_reconcile(trans, NULL, &opts, bkey_i_to_s(&e->k_i),
+						      BKEY_EXTENT_U64s_MAX,
 						      SET_NEEDS_RECONCILE_opt_change, 0) ?:
 			bch2_btree_insert(c, BTREE_ID_extents, &e->k_i, &res, 0, 0);
 		}));
